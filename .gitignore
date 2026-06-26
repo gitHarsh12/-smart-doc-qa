@@ -1,0 +1,92 @@
+# ============================================================
+# 🛡️ .gitignore — secrets + temp files + build artifacts
+# ============================================================
+
+# ── Secrets (CRITICAL — never commit) ──
+.streamlit/secrets.toml
+.env
+.env.*
+*.key
+*.pem
+secrets.json
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# ── Virtual environments ──
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# ── IDE ──
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+
+# ── Testing / Coverage ──
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+
+# ── Logs ──
+*.log
+logs/
+locust_*.csv
+*_results.csv
+load_tests/results/
+
+# ── FAISS index + cache (runtime artifacts) ──
+~/.cache/rag_app/
+*.index
+faiss_meta.json
+faiss.index
+
+# ── Uploads (temp files from OCR) ──
+uploads/
+*.tmp
+*.temp
+
+# ── OS files ──
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Jupyter ──
+.ipynb_checkpoints
+*.ipynb
+
+# ── Streamlit ──
+.streamlit/cache/
