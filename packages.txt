@@ -1,21 +1,7 @@
-# ============================================================
-# Streamlit Community Cloud - System Dependencies
-# Only the required Ubuntu packages
-# ============================================================
-
-# PDF Processing (required by pdf2image)
 poppler-utils
-
-# OCR (required by pytesseract)
 tesseract-ocr
 tesseract-ocr-eng
-
-# EasyOCR / OpenCV
 libgl1-mesa-glx
 libglib2.0-0
-
-# python-magic
 libmagic1
-
-# Build tools (required by some Python packages)
 build-essential
