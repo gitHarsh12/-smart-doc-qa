@@ -1,42 +1,21 @@
 # ============================================================
-# 📦 Streamlit Cloud — System Dependencies
-# ============================================================
-# Streamlit Cloud pe kuch Python packages system-level
-# libraries maangte hain. Yeh file un requirements ko install
-# karti hai automatically.
-#
-# Format: apt-get package names (one per line)
+# Streamlit Community Cloud - System Dependencies
+# Only the required Ubuntu packages
 # ============================================================
 
-# ── PDF processing ──
-poppler-utils          # pdf2image ke liye (PDF → image conversion)
-libpoppler-cpp-dev     # PyPDF2 advanced features ke liye
-libpoppler-dev
+# PDF Processing (required by pdf2image)
+poppler-utils
 
-# ── OCR (image → text) ──
-tesseract-ocr          # pytesseract ka engine
-tesseract-ocr-eng      # English language data
-# tesseract-ocr-hin    # Hindi OCR (uncomment if needed)
+# OCR (required by pytesseract)
+tesseract-ocr
+tesseract-ocr-eng
 
-# ── Image processing ──
-libjpeg-dev            # JPEG support for Pillow
-libpng-dev             # PNG support for Pillow
-zlib1g-dev             # Compression for images
-libfreetype6-dev       # Font rendering
-liblcms2-dev           # Color management
-libopenjp2-7-dev       # JPEG 2000 support
-libtiff-dev            # TIFF support
+# EasyOCR / OpenCV
+libgl1-mesa-glx
+libglib2.0-0
 
-# ── Machine Learning ──
-libgl1-mesa-glx        # OpenCV / image processing
-libglib2.0-0           # GLib (EasyOCR dependency)
+# python-magic
+libmagic1
 
-# ── Misc ──
-libmagic1              # python-magic ke liye (file type detection)
-libxml2-dev            # XML parsing
-libxslt1-dev           # XSLT processing
-ffi                    # Foreign function interface
-
-# ── Build tools (some Python packages need these) ──
-build-essential        # gcc, make, etc.
-python3-dev            # Python headers for compilation
+# Build tools (required by some Python packages)
+build-essential
