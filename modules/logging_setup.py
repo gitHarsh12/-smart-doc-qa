@@ -118,6 +118,37 @@ def setup_logging(level: str = "INFO", enable_sentry: bool = True) -> logging.Lo
     handler.setFormatter(JSONFormatter())
     root_logger.addHandler(handler)
 
+    # ============================================================
+    # v3.0.7: Silence noisy/harmless loggers
+    # ============================================================
+    # These errors are LOGGED but DON'T break the app:
+    #
+    # 1. starlette.requests.ClientDisconnect
+    #    - Happens when user closes browser/navigates away during upload
+    #    - 100% harmless, just log clutter
+    #
+    # 2. urllib3 connection warnings
+    #    - Happens on transient network issues
+    #
+    # 3. EasyOCR/torch warnings (if installed)
+    #    - Deprecation warnings, not errors
+    #
+    # 4. matplotlib/PIL debug noise
+    # ============================================================
+    noisy_loggers = [
+        "starlette.requests",       # ClientDisconnect on upload cancel
+        "starlette.middleware",     # Middleware debug noise
+        "urllib3.connectionpool",   # Transient network retries
+        "urllib3.util.retry",       # Retry warnings
+        "PIL.PngImagePlugin",       # PNG metadata warnings
+        "matplotlib.font_manager",  # Font search noise
+        "easyocr",                  # EasyOCR verbose (if installed)
+        "pdfminer",                 # PDF parsing warnings
+        "PyPDF2",                   # PDF parsing warnings
+    ]
+    for logger_name in noisy_loggers:
+        logging.getLogger(logger_name).setLevel(logging.ERROR)
+
     # Sentry integration (optional)
     if enable_sentry:
         sentry_dsn = os.getenv("SENTRY_DSN")
