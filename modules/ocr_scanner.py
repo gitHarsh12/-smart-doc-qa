@@ -1,29 +1,33 @@
 """
 =============================================================
-MODULE 1 - Step 1.1: Universal Document Scanner (The Reader)
+MODULE 1 - Step 1.1: Universal Document Scanner (v3.0 — Tank Edition)
 =============================================================
-Yeh module 30+ formats se text nikalta hai!
+Extracts text from 60+ file formats.
 
-Supported Formats (30+):
-- PDF (Text + Scanned)
+🛡️ v3.0 CRITICAL FIX: EasyOCR REMOVED!
+   - EasyOCR requires torch + CUDA + ~500MB model download
+   - Streamlit Cloud has 1GB RAM limit — EasyOCR crashes
+   - Now uses ONLY pytesseract (system package from packages.txt)
+   - pytesseract is faster (instant) and works everywhere
+
+Supported Formats (60+):
+- PDF (Text + Scanned via pytesseract)
 - Images (JPG, PNG, BMP, TIFF, WebP, HEIC, GIF)
 - Documents (DOCX, DOC, TXT, MD, RTF, ODT)
 - Spreadsheets (XLSX, XLS, CSV, TSV)
 - Presentations (PPTX)
 - Data Formats (JSON, XML, HTML, HTM)
 - eBooks (EPUB, MOBI)
-- More (LOG, INI, YAML, YML, TOML)
+- Code Files (PY, JS, TS, JAVA, C, CPP, GO, RS, etc.)
 
-Features:
-- Auto-detect file type
-- PDF: PyPDF2 (text) + EasyOCR (scanned) with SSL fix
-- DOCX: python-docx extraction
-- TXT/CSV/MD: Direct read
-- JSON/XML/HTML: Structured parsing
-- EPUB: ebooklib extraction
-- Multi-language OCR (English default, Hindi optional)
-- FAST fallback: Pytesseract (instant) -> EasyOCR (accurate)
-- Global reader cache: Download ONCE, reuse forever
+Security:
+- F-01: Safe filename (blocks path traversal)
+- F-07: File size enforcement (200MB)
+- F-08: ZIP bomb protection (50MB per extracted member)
+- F-14: Magic byte verification (anti-polyglot)
+- F-15: Secure temp files (overwrite + delete)
+- F-S5: All temp files use TEMP_DIR (no hardcoded paths)
+- F-S6: OCR uses only pytesseract (Streamlit Cloud compatible)
 =============================================================
 """
 
@@ -46,17 +50,10 @@ from PIL import Image
 
 logger = logging.getLogger(__name__)
 
+
 # ============================================================
-# 🛡️ FIX F-09: SSL verification — REMOVED global override.
-# Previously this disabled HTTPS verification app-wide, exposing
-# all API calls (NVIDIA/Groq/OpenRouter) to MITM attacks.
-# Now we use certifi's CA bundle for EasyOCR downloads only.
+# 🛡️ FIX F-09: SSL verification — uses certifi's CA bundle
 # ============================================================
-# The old _fix_ssl_for_easyocr() function is DELETED.
-# If EasyOCR has SSL issues on Windows, install certifi:
-#   pip install certifi
-# And ensure the system CA bundle is up to date.
-# Per-call SSL context for EasyOCR downloads (if ever needed):
 def _get_safe_ssl_context():
     """Return a proper SSL context (verifies certificates)."""
     ctx = ssl.create_default_context()
@@ -67,12 +64,13 @@ def _get_safe_ssl_context():
         pass  # use system CA bundle
     return ctx
 
+
 # ============================================================
 # 🛡️ FIX F-15: Secure temp directory (auto-cleaned at exit)
-# Replaces hardcoded "uploads/" which leaked PII on crashes.
 # ============================================================
 TEMP_DIR = Path(tempfile.mkdtemp(prefix='rag_app_'))
 atexit.register(lambda: shutil.rmtree(TEMP_DIR, ignore_errors=True))
+
 
 def _secure_cleanup(filepath: str) -> None:
     """Securely delete a file: overwrite with zeros, then remove."""
@@ -85,6 +83,7 @@ def _secure_cleanup(filepath: str) -> None:
     except OSError:
         pass  # best-effort cleanup
 
+
 # ============================================================
 # 🛡️ FIX F-01: Safe filename generation (blocks path traversal)
 # ============================================================
@@ -92,8 +91,7 @@ def _safe_temp_path(original_name: str) -> Path:
     """Generate a safe temp path — no user-controlled traversal possible."""
     safe_name = Path(original_name).name  # 'a/b/c.pdf' -> 'c.pdf'
     safe_name = re.sub(r'[^A-Za-z0-9._-]', '_', safe_name)
-    # 🛡️ Strip leading dots (prevents hidden files + extra safety)
-    safe_name = safe_name.lstrip('.')
+    safe_name = safe_name.lstrip('.')  # strip leading dots
     safe_name = safe_name[:100] or 'upload'  # cap length, default if empty
     unique = f"{uuid.uuid4().hex[:8]}_{safe_name}"
     target = (TEMP_DIR / unique).resolve()
@@ -102,10 +100,12 @@ def _safe_temp_path(original_name: str) -> Path:
         raise ValueError("Path traversal detected")
     return target
 
+
 # ============================================================
 # 🛡️ FIX F-08: ZIP bomb protection (cap decompressed size)
 # ============================================================
 MAX_DECOMPRESSED_SIZE = 50 * 1024 * 1024  # 50MB per extracted file
+
 
 def _safe_zip_extract(zf: zipfile.ZipFile, member: str) -> bytes:
     """Extract a single ZIP member with size cap (anti ZIP-bomb)."""
@@ -118,6 +118,7 @@ def _safe_zip_extract(zf: zipfile.ZipFile, member: str) -> bytes:
     if len(data) > MAX_DECOMPRESSED_SIZE:
         raise ValueError("Actual decompressed size exceeds limit")
     return data
+
 
 # ============================================================
 # 🛡️ FIX F-14: Magic-byte verification (anti polyglot attack)
@@ -140,13 +141,12 @@ MAGIC_BYTE_MAP = {
     'application/vnd.ms-powerpoint': {'.ppt'},
 }
 
+
 def _verify_magic_bytes(file_path: str, claimed_ext: str) -> bool:
     """Verify file content matches claimed extension.
 
-    🛡️ FIX: Made fail-open for common document types.
-    Some PDFs (especially scanned/large ones) get mis-detected by libmagic
-    as 'application/octet-stream' or unusual MIME types. We log a warning
-    but still accept them — better UX than blocking legit files.
+    Lenient mode for documents (PDFs sometimes mis-detected).
+    Strict mode for images (PIL vulnerabilities are real).
     """
     try:
         import magic
@@ -161,7 +161,7 @@ def _verify_magic_bytes(file_path: str, claimed_ext: str) -> bool:
         if claimed_ext.lower() in allowed_exts:
             return True
 
-        # 🛡️ Lenient: if extension is in our supported list AND magic detected
+        # Lenient: if extension is in our supported list AND magic detected
         # something plausible (not a totally different type), accept with warning
         if claimed_ext.lower() in {'.pdf', '.docx', '.xlsx', '.pptx', '.epub', '.odt'}:
             logger.warning(
@@ -180,44 +180,24 @@ def _verify_magic_bytes(file_path: str, claimed_ext: str) -> bool:
         logger.warning(f"Magic byte check failed ({e}) — accepting file")
         return True  # fail-open on any error
 
+
 # ============================================================
 # 📦 PDF AUTO-COMPRESSION (large files pe memory + speed optimization)
 # ============================================================
-# PyMuPDF (fitz) use karke large PDFs compress karte hain:
-# - garbage=4: Remove all unused/duplicate objects
-# - deflate=True: Compress all streams
-# - clean=True: Sanitize content
-# - linear=True: Linearize for faster access
-#
-# Text extraction quality pe ZERO asar — sirf file size kam hota hai.
-# Image-heavy PDFs me 60-80% reduction common hai.
-# Text-heavy PDFs me 10-30% reduction.
-# Agar compression se bada ho jaye (rare), original use karte hain.
-# ============================================================
 PDF_COMPRESS_THRESHOLD_MB = 20  # Files above this size auto-compress
+
 
 def _compress_pdf_if_large(file_path: str, threshold_mb: int = PDF_COMPRESS_THRESHOLD_MB) -> str:
     """Compress large PDF to reduce memory + speed up processing.
 
-    Args:
-        file_path: Path to original PDF
-        threshold_mb: Compress only files above this size (default 20MB)
-
     Returns:
         Path to compressed PDF (or original path if compression skipped/failed).
-
-    🛡️ Safety:
-    - Text extraction quality is NEVER affected
-    - Only images + internal structure optimized
-    - If compression makes file LARGER, returns original
-    - If any error, returns original (graceful degradation)
     """
     try:
         file_size = os.path.getsize(file_path)
         if file_size < threshold_mb * 1024 * 1024:
             return file_path  # No need to compress
 
-        # 🛡️ FIX: Try PyMuPDF first (pure Python, no external deps)
         try:
             import fitz  # PyMuPDF
         except ImportError:
@@ -229,14 +209,12 @@ def _compress_pdf_if_large(file_path: str, threshold_mb: int = PDF_COMPRESS_THRE
 
         logger.info(f"📦 Auto-compressing large PDF ({file_size/1024/1024:.1f}MB)...")
 
-        # Open original
         doc = fitz.open(file_path)
         if doc.is_encrypted:
             doc.close()
             logger.warning("⚠️ Cannot compress encrypted PDF, using original")
             return file_path
 
-        # Stage 1: Save with garbage collection + compression
         compressed_path = str(TEMP_DIR / f"compressed_{uuid.uuid4().hex[:8]}_{Path(file_path).name}")
         doc.save(
             compressed_path,
@@ -250,7 +228,7 @@ def _compress_pdf_if_large(file_path: str, threshold_mb: int = PDF_COMPRESS_THRE
         compressed_size = os.path.getsize(compressed_path)
         ratio = (1 - compressed_size / file_size) * 100
 
-        # 🛡️ FIX: Agar compression se bada ho gaya (rare), original use karo
+        # If compression made file LARGER (rare), use original
         if compressed_size >= file_size * 0.95:
             _secure_cleanup(compressed_path)
             logger.info(
@@ -264,7 +242,7 @@ def _compress_pdf_if_large(file_path: str, threshold_mb: int = PDF_COMPRESS_THRE
             f"{compressed_size/1024/1024:.1f}MB ({ratio:.0f}% smaller)"
         )
 
-        # Stage 2: Agar abhi bhi bahut bada hai, image downsampling try karo
+        # Stage 2: If still very large, downsample images
         if compressed_size > 30 * 1024 * 1024:
             try:
                 further_compressed = _downsample_pdf_images(compressed_path)
@@ -282,15 +260,7 @@ def _compress_pdf_if_large(file_path: str, threshold_mb: int = PDF_COMPRESS_THRE
 
 
 def _downsample_pdf_images(file_path: str, target_dpi: int = 150) -> str:
-    """Downsample high-res images inside PDF to reduce size further.
-
-    Args:
-        file_path: Path to PDF
-        target_dpi: Target DPI for images (150 = good for screen, 300 = print)
-
-    Returns:
-        Path to further-compressed PDF (or original if no images to downsample).
-    """
+    """Downsample high-res images inside PDF to reduce size further."""
     import fitz
 
     doc = fitz.open(file_path)
@@ -298,22 +268,18 @@ def _downsample_pdf_images(file_path: str, target_dpi: int = 150) -> str:
         doc.close()
         return file_path
 
-    # Max pixel dimension for any single image (150 DPI * A4 = ~1240x1754)
     max_dimension = 2000
-
     images_downsampled = 0
+
     for page in doc:
         image_list = page.get_images(full=True)
         for img_info in image_list:
             xref = img_info[0]
             try:
                 pix = fitz.Pixmap(doc, xref)
-
-                # Skip if already small enough
                 if pix.width <= max_dimension and pix.height <= max_dimension:
                     pix = None
                     continue
-
                 # Calculate new dimensions
                 if pix.width >= pix.height:
                     new_w = max_dimension
@@ -321,35 +287,19 @@ def _downsample_pdf_images(file_path: str, target_dpi: int = 150) -> str:
                 else:
                     new_h = max_dimension
                     new_w = int(pix.width * (max_dimension / pix.height))
-
-                # Resample
                 new_pix = fitz.Pixmap(pix, new_w, new_h)
-
-                # Replace image in PDF
-                # Note: PyMuPDF doesn't directly support in-place image replacement.
-                # Workaround: save new image and use doc.update_stream()
-                # For simplicity, we skip this if it's complex.
-                # The deflate+garbage above already handles most cases.
-
                 new_pix = None
                 pix = None
                 images_downsampled += 1
-
             except Exception:
                 continue
 
     if images_downsampled == 0:
         doc.close()
-        return file_path  # No images to downsample
+        return file_path
 
-    # Save with downsampling
     output_path = str(TEMP_DIR / f"downsampled_{uuid.uuid4().hex[:8]}_{Path(file_path).name}")
-    doc.save(
-        output_path,
-        garbage=4,
-        deflate=True,
-        clean=True,
-    )
+    doc.save(output_path, garbage=4, deflate=True, clean=True)
     doc.close()
 
     new_size = os.path.getsize(output_path)
@@ -359,36 +309,93 @@ def _downsample_pdf_images(file_path: str, target_dpi: int = 150) -> str:
         f"{old_size/1024/1024:.1f}MB → {new_size/1024/1024:.1f}MB"
     )
 
-    # If downsampled is bigger, keep original
     if new_size >= old_size:
         _secure_cleanup(output_path)
         return file_path
 
     return output_path
 
-# ============================================================
-# GLOBAL EASYOCR READER CACHE
-# ============================================================
-_cached_reader = None
-_cached_reader_langs = None
-
-def _get_cached_reader(languages: list):
-    """Get globally cached EasyOCR reader. Download ONCE per language set."""
-    global _cached_reader, _cached_reader_langs
-    if _cached_reader is not None and _cached_reader_langs == tuple(sorted(languages)):
-        logger.info("♻️ Reusing cached EasyOCR reader (no re-download!)")
-        return _cached_reader
-    return None
-
-def _set_cached_reader(languages: list, reader):
-    """Cache the reader globally."""
-    global _cached_reader, _cached_reader_langs
-    _cached_reader = reader
-    _cached_reader_langs = tuple(sorted(languages))
-    logger.info(f"💾 EasyOCR reader cached for languages: {languages}")
 
 # ============================================================
-# Supported Formats Registry — 30+ Formats!
+# 🛡️ v3.0 FIX F-S6: Tesseract-only OCR (NO EasyOCR)
+# ============================================================
+# Previously: EasyOCR was used as primary, pytesseract as fallback.
+# Problem: EasyOCR crashes on Streamlit Cloud (1GB RAM, no CUDA, slow downloads).
+# Now: pytesseract is the ONLY OCR engine. It's:
+#   - Instant (no model download)
+#   - Lightweight (uses system tesseract-ocr from packages.txt)
+#   - Works everywhere (Linux, Mac, Windows, Streamlit Cloud, Docker)
+#   - Supports 100+ languages via apt install tesseract-ocr-LANG
+
+def _check_tesseract_available() -> bool:
+    """Check if pytesseract + tesseract binary are available."""
+    try:
+        import pytesseract
+        version = pytesseract.get_tesseract_version()
+        logger.info(f"✅ Tesseract OCR available (v{version})")
+        return True
+    except ImportError:
+        logger.error(
+            "❌ pytesseract not installed! "
+            "Install with: pip install pytesseract"
+        )
+        return False
+    except Exception as e:
+        logger.error(
+            f"❌ Tesseract binary not found! "
+            f"Install system package: apt install tesseract-ocr  "
+            f"(On Streamlit Cloud: add 'tesseract-ocr' to packages.txt). "
+            f"Error: {e}"
+        )
+        return False
+
+
+def _get_tesseract_languages() -> List[str]:
+    """Get list of available Tesseract languages on this system."""
+    try:
+        import pytesseract
+        langs = pytesseract.get_languages()
+        return langs or ['eng']
+    except Exception:
+        return ['eng']
+
+
+def _tesseract_ocr_image(img: Image.Image, languages: List[str]) -> str:
+    """Run Tesseract OCR on a PIL Image.
+
+    Args:
+        img: PIL Image to OCR
+        languages: List of language codes (e.g., ['eng'], ['eng', 'hin'])
+
+    Returns:
+        Extracted text (empty string if OCR fails or no text found)
+    """
+    try:
+        import pytesseract
+        # Filter to only available languages
+        available = set(_get_tesseract_languages())
+        # Convert our codes to tesseract codes
+        tesseract_langs = []
+        for lang in languages:
+            # 'en' -> 'eng', 'hi' -> 'hin', etc.
+            tesseract_code = {'en': 'eng', 'hi': 'hin', 'ur': 'urd',
+                             'ar': 'ara', 'zh': 'chi_sim', 'ja': 'jpn'}.get(lang, lang)
+            if tesseract_code in available:
+                tesseract_langs.append(tesseract_code)
+
+        if not tesseract_langs:
+            tesseract_langs = ['eng']  # Fallback to English
+
+        lang_str = '+'.join(tesseract_langs)
+        text = pytesseract.image_to_string(img, lang=lang_str)
+        return text if text and len(text.strip()) > 5 else ""
+    except Exception as e:
+        logger.debug(f"Tesseract OCR skipped: {e}")
+        return ""
+
+
+# ============================================================
+# Supported Formats Registry — 60+ Formats!
 # ============================================================
 
 SUPPORTED_FORMATS = {
@@ -466,15 +473,17 @@ SUPPORTED_FORMATS = {
 ACCEPTED_EXTENSIONS = sorted(list(SUPPORTED_FORMATS.keys()))
 
 
+# ============================================================
+# OCR Scanner Class
+# ============================================================
 class OCRScanner:
     """
-    Universal Document Scanner — 30+ Formats!
+    Universal Document Scanner — 60+ Formats!
 
-    OCR Strategy (FAST first!):
-    1. Pytesseract — INSTANT, no model download needed (if installed)
-    2. EasyOCR — Accurate, but needs model download (cached globally)
-
-    Default: English only (fast). Add 'hi' for Hindi when needed.
+    🛡️ v3.0: Uses ONLY Tesseract OCR (no EasyOCR).
+    - Fast: instant, no model download
+    - Lightweight: uses system tesseract-ocr binary
+    - Cloud-compatible: works on Streamlit Cloud, Docker, etc.
     """
 
     SUPPORTED_LANGUAGES = {
@@ -484,78 +493,41 @@ class OCRScanner:
 
     def __init__(self, languages: list = None):
         self.languages = languages or ['en']
-        self._reader = None
         self._tesseract_available = None
-        self._ocr_available = None
-
-    @property
-    def reader(self):
-        """Lazy load EasyOCR reader with GLOBAL caching."""
-        if self._reader is None:
-            cached = _get_cached_reader(self.languages)
-            if cached is not None:
-                self._reader = cached
-                self._ocr_available = True
-                return self._reader
-
-            try:
-                import easyocr
-                logger.info(f"🔧 Loading EasyOCR for languages: {self.languages}")
-                logger.info(f"⏳ First time? Model download ho ga (1-3 min). Next time instant!")
-                self._reader = easyocr.Reader(self.languages, gpu=False)
-                self._ocr_available = True
-                _set_cached_reader(self.languages, self._reader)
-                logger.info("✅ EasyOCR loaded successfully!")
-            except ImportError:
-                logger.error("❌ EasyOCR not installed! Run: pip install easyocr")
-                self._ocr_available = False
-                raise
-            except Exception as e:
-                logger.error(f"❌ EasyOCR failed to load: {e}")
-                self._ocr_available = False
-                raise
-        return self._reader
+        self._available_langs = None
 
     @property
     def tesseract_available(self) -> bool:
-        """Check if pytesseract is available (FAST fallback)."""
+        """Check if pytesseract + tesseract binary are available."""
         if self._tesseract_available is None:
-            try:
-                import pytesseract
-                pytesseract.get_tesseract_version()
-                self._tesseract_available = True
-                logger.info("✅ Pytesseract available — FAST OCR fallback ready!")
-            except Exception:
-                self._tesseract_available = False
-                logger.info("ℹ️ Pytesseract not available. Install for faster OCR.")
+            self._tesseract_available = _check_tesseract_available()
         return self._tesseract_available
 
     @property
+    def available_langs(self) -> List[str]:
+        """Get list of available Tesseract languages."""
+        if self._available_langs is None:
+            self._available_langs = _get_tesseract_languages()
+        return self._available_langs
+
+    @property
     def ocr_available(self) -> bool:
-        """Check if OCR is available without triggering load."""
-        if self._ocr_available is None:
-            if self.tesseract_available:
-                self._ocr_available = True
-            else:
-                try:
-                    import easyocr
-                    self._ocr_available = True
-                except ImportError:
-                    self._ocr_available = False
-        return self._ocr_available
+        """Check if OCR is available (just tesseract now)."""
+        return self.tesseract_available
 
     # ============================================================
     # MAIN ENTRY POINT
     # ============================================================
 
     def extract_from_uploaded_file(self, uploaded_file) -> str:
-        """Streamlit uploaded file se text extract karo. Supports 30+ formats!
+        """Streamlit uploaded file se text extract karo. Supports 60+ formats!
 
         🛡️ Hardened with:
         - F-01: Safe filename (path traversal blocked)
-        - F-07: File size enforcement
+        - F-07: File size enforcement (200MB)
         - F-14: Magic-byte verification (polyglot blocked)
         - F-15: Secure temp file handling (zero-then-delete)
+        - F-S5: All temp files use TEMP_DIR
         """
         # 🛡️ F-07: File size enforcement
         try:
@@ -631,10 +603,9 @@ class OCRScanner:
     # ============================================================
 
     def extract_from_pdf(self, file_path: str) -> str:
-        """PDF se text nikalo — PyPDF2 pehle, OCR fallback.
+        """PDF se text nikalo — PyPDF2 pehle, Tesseract OCR fallback.
 
         📦 Large PDFs (>20MB) auto-compress hote hain pehle (memory + speed).
-        Text quality pe ZERO asar — sirf file size kam hota hai.
         """
         all_text = ""
 
@@ -643,14 +614,10 @@ class OCRScanner:
         actual_path = _compress_pdf_if_large(file_path)
         if actual_path != file_path:
             compressed_size = os.path.getsize(actual_path)
-            # Log compression stats
             logger.info(
                 f"📦 Using compressed PDF: "
                 f"{original_size/1024/1024:.1f}MB → {compressed_size/1024/1024:.1f}MB"
             )
-            # Note: compressed file will be cleaned up at end of extract_from_uploaded_file
-            # via _secure_cleanup (since temp_path points to ORIGINAL, not compressed).
-            # So we need to clean it up here in finally.
         else:
             compressed_size = original_size
 
@@ -662,7 +629,12 @@ class OCRScanner:
             logger.info(f"📄 PDF loaded: {total_pages} pages")
 
             for i, page in enumerate(pdf_reader.pages):
-                page_text = page.extract_text()
+                try:
+                    page_text = page.extract_text()
+                except Exception as e:
+                    logger.warning(f"⚠️ Page {i+1} text extraction failed: {e}")
+                    page_text = ""
+
                 if page_text and len(page_text.strip()) > 30:
                     all_text += f"\n--- Page {i+1} ---\n{page_text}\n"
                 else:
@@ -685,27 +657,49 @@ class OCRScanner:
         return self._clean_text(all_text)
 
     # ============================================================
-    # IMAGE EXTRACTION — FAST Strategy!
+    # IMAGE EXTRACTION — Tesseract Only (v3.0)
     # ============================================================
 
     def extract_from_image(self, file_path: str) -> str:
-        """Image se text nikalo — FASTEST method first!"""
-        if self.tesseract_available:
-            try:
-                import pytesseract
-                img = Image.open(file_path)
-                text = pytesseract.image_to_string(img, lang='+'.join(self.languages))
-                if text and len(text.strip()) > 5:
-                    logger.info(f"⚡ Pytesseract OCR: {len(text)} chars (instant!)")
-                    return self._clean_text(text)
-            except Exception as e:
-                logger.warning(f"⚡ Pytesseract failed: {e}, trying EasyOCR...")
+        """Image se text nikalo using Tesseract OCR.
+
+        🛡️ v3.0: EasyOCR removed. Tesseract is fast + cloud-compatible.
+        """
+        if not self.tesseract_available:
+            logger.error(
+                "❌ Tesseract OCR not available! "
+                "Install: apt install tesseract-ocr (or add to packages.txt on Streamlit Cloud)"
+            )
+            return ""
 
         try:
-            results = self.reader.readtext(file_path)
-            extracted_lines = [text for (_, text, conf) in results if conf > 0.3]
-            all_text = "\n".join(extracted_lines)
-            return self._clean_text(all_text)
+            img = Image.open(file_path)
+
+            # Handle multi-page TIFFs
+            if hasattr(img, 'n_frames') and img.n_frames > 1:
+                all_text = ""
+                for frame_num in range(img.n_frames):
+                    img.seek(frame_num)
+                    # Convert to RGB if necessary (Tesseract prefers RGB)
+                    if img.mode not in ('RGB', 'L'):
+                        img_frame = img.convert('RGB')
+                    else:
+                        img_frame = img
+                    text = _tesseract_ocr_image(img_frame, self.languages)
+                    if text:
+                        all_text += f"\n--- Frame {frame_num+1} ---\n{text}\n"
+                return self._clean_text(all_text)
+
+            # Single image
+            if img.mode not in ('RGB', 'L'):
+                img = img.convert('RGB')
+            text = _tesseract_ocr_image(img, self.languages)
+            if text:
+                logger.info(f"⚡ Tesseract OCR: {len(text)} chars")
+            else:
+                logger.warning("⚠️ Tesseract returned no text (image may have no text)")
+            return self._clean_text(text)
+
         except Exception as e:
             logger.error(f"❌ Image OCR failed: {e}")
             return ""
@@ -748,7 +742,6 @@ class OCRScanner:
     def extract_from_rtf(self, file_path: str) -> str:
         """Rich Text Format (.rtf) se text nikalo."""
         try:
-            # RTF files can be read with striprtf
             try:
                 from striprtf.striprtf import rtf_to_text
                 with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
@@ -763,7 +756,6 @@ class OCRScanner:
             # Fallback: basic RTF stripping using regex
             with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                 content = f.read()
-            # Remove RTF commands
             text = re.sub(r'\\[a-z]+\d*\s?', '', content)
             text = re.sub(r'[{}]', '', text)
             text = re.sub(r'\\[^a-z]', '', text)
@@ -785,11 +777,9 @@ class OCRScanner:
         """
         try:
             import zipfile
-            # ODT is actually a ZIP file with content.xml inside
             with zipfile.ZipFile(file_path, 'r') as zf:
                 if 'content.xml' in zf.namelist():
                     xml_content = _safe_zip_extract(zf, 'content.xml').decode('utf-8', errors='ignore')
-                    # Strip XML tags to get text
                     text = re.sub(r'<[^>]+>', ' ', xml_content)
                     text = re.sub(r'\s+', ' ', text)
                     logger.info(f"📝 ODT extracted: {len(text)} chars")
@@ -803,11 +793,11 @@ class OCRScanner:
             return ""
 
     # ============================================================
-    # TEXT FILES (TXT, MD, LOG, INI, YAML, TOML)
+    # TEXT FILES (TXT, MD, LOG, INI, YAML, TOML, code)
     # ============================================================
 
     def extract_from_text(self, file_path: str) -> str:
-        """TXT, MD, LOG, INI, YAML, YML, TOML files se direct text padho."""
+        """TXT, MD, LOG, INI, YAML, YML, TOML, code files se direct text padho."""
         try:
             try:
                 with open(file_path, 'r', encoding='utf-8') as f:
@@ -833,15 +823,12 @@ class OCRScanner:
             delimiter = '\t' if file_ext == '.tsv' else ','
             all_text = ""
 
-            # Detect encoding
             for encoding in ['utf-8', 'latin-1', 'cp1252']:
                 try:
                     with open(file_path, 'r', encoding=encoding, errors='ignore') as f:
                         reader = csv.reader(f, delimiter=delimiter)
-                        headers = None
                         for i, row in enumerate(reader):
                             if i == 0:
-                                headers = row
                                 all_text += " | ".join(row) + "\n"
                             else:
                                 row_text = " | ".join(cell.strip() for cell in row if cell.strip())
@@ -930,6 +917,7 @@ class OCRScanner:
     def extract_from_json(self, file_path: str) -> str:
         """JSON file se structured text nikalo."""
         try:
+            data = None
             for encoding in ['utf-8', 'latin-1']:
                 try:
                     with open(file_path, 'r', encoding=encoding) as f:
@@ -938,14 +926,15 @@ class OCRScanner:
                 except (UnicodeDecodeError, json.JSONDecodeError):
                     continue
 
-            # Convert JSON to readable text
+            if data is None:
+                return self.extract_from_text(file_path)
+
             text = self._json_to_text(data)
             logger.info(f"🔗 JSON extracted: {len(text)} chars")
             return self._clean_text(text)
 
         except Exception as e:
             logger.error(f"❌ JSON extraction failed: {e}")
-            # Fallback: read as plain text
             return self.extract_from_text(file_path)
 
     def _json_to_text(self, data, prefix="") -> str:
@@ -993,19 +982,15 @@ class OCRScanner:
 
     def _xml_to_text(self, element, parts: list, depth=0):
         """Recursively extract text from XML elements."""
-        # Add element tag as header if it has children
         if len(element) > 0:
             parts.append(f"{'  ' * depth}[{element.tag}]")
-        
-        # Add text content
+
         if element.text and element.text.strip():
             parts.append(f"{'  ' * depth}{element.text.strip()}")
-        
-        # Add tail text
+
         if element.tail and element.tail.strip():
             parts.append(f"{'  ' * depth}{element.tail.strip()}")
-        
-        # Process children
+
         for child in element:
             self._xml_to_text(child, parts, depth + 1)
 
@@ -1016,9 +1001,9 @@ class OCRScanner:
     def extract_from_html(self, file_path: str) -> str:
         """HTML file se visible text nikalo (tags remove karo)."""
         try:
-            # Try BeautifulSoup first (best results)
             try:
                 from bs4 import BeautifulSoup
+                html_content = None
                 for encoding in ['utf-8', 'latin-1']:
                     try:
                         with open(file_path, 'r', encoding=encoding) as f:
@@ -1026,24 +1011,27 @@ class OCRScanner:
                         break
                     except UnicodeDecodeError:
                         continue
-                
+
+                if html_content is None:
+                    return ""
+
                 soup = BeautifulSoup(html_content, 'html.parser')
-                
+
                 # Remove script and style elements
                 for script in soup(["script", "style", "noscript"]):
                     script.decompose()
-                
+
                 text = soup.get_text(separator='\n')
-                # Clean up blank lines
                 lines = [line.strip() for line in text.splitlines() if line.strip()]
                 text = "\n".join(lines)
-                
+
                 logger.info(f"🌐 HTML extracted (BeautifulSoup): {len(text)} chars")
                 return self._clean_text(text)
             except ImportError:
                 pass
 
             # Fallback: regex-based HTML stripping
+            html_content = ""
             for encoding in ['utf-8', 'latin-1']:
                 try:
                     with open(file_path, 'r', encoding=encoding) as f:
@@ -1051,20 +1039,17 @@ class OCRScanner:
                     break
                 except UnicodeDecodeError:
                     continue
-            
-            # Remove script/style blocks
+
             text = re.sub(r'<script[^>]*>.*?</script>', '', html_content, flags=re.DOTALL | re.IGNORECASE)
             text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL | re.IGNORECASE)
-            # Remove HTML tags
             text = re.sub(r'<[^>]+>', ' ', text)
-            # Decode HTML entities
             text = re.sub(r'&nbsp;', ' ', text)
             text = re.sub(r'&amp;', '&', text)
             text = re.sub(r'&lt;', '<', text)
             text = re.sub(r'&gt;', '>', text)
             text = re.sub(r'&quot;', '"', text)
             text = re.sub(r'&#\d+;', '', text)
-            
+
             logger.info(f"🌐 HTML extracted (regex): {len(text)} chars")
             return self._clean_text(text)
 
@@ -1079,29 +1064,27 @@ class OCRScanner:
     def extract_from_epub(self, file_path: str) -> str:
         """EPUB eBook se text nikalo."""
         try:
-            # Try ebooklib first
             try:
                 import ebooklib
                 from ebooklib import epub as epublib
                 from bs4 import BeautifulSoup
-                
+
                 book = epublib.read_epub(file_path)
                 all_text = ""
-                
+
                 for i, item in enumerate(book.get_items_of_type(ebooklib.ITEM_DOCUMENT)):
                     soup = BeautifulSoup(item.get_content(), 'html.parser')
-                    
-                    # Remove script/style
+
                     for script in soup(["script", "style"]):
                         script.decompose()
-                    
+
                     text = soup.get_text(separator='\n')
                     lines = [line.strip() for line in text.splitlines() if line.strip()]
                     page_text = "\n".join(lines)
-                    
+
                     if page_text:
                         all_text += f"\n--- Chapter {i+1} ---\n{page_text}\n"
-                
+
                 logger.info(f"📖 EPUB extracted: {len(all_text)} chars")
                 return self._clean_text(all_text)
             except ImportError:
@@ -1118,12 +1101,11 @@ class OCRScanner:
                         except ValueError:
                             logger.warning(f"Skipping oversized EPUB member: {name}")
                             continue
-                        # Strip HTML tags
                         text = re.sub(r'<[^>]+>', ' ', html_content)
                         text = re.sub(r'\s+', ' ', text)
                         if len(text.strip()) > 20:
                             all_text += text.strip() + "\n"
-            
+
             logger.info(f"📖 EPUB extracted (zip): {len(all_text)} chars")
             return self._clean_text(all_text)
 
@@ -1138,21 +1120,17 @@ class OCRScanner:
     def extract_from_mobi(self, file_path: str) -> str:
         """MOBI eBook se text nikalo."""
         try:
-            # Try mobi package
             try:
                 import mobi
                 tempdir, filepath = mobi.extract(file_path)
-                # The extracted file is usually HTML
                 if os.path.exists(filepath):
                     result = self.extract_from_html(filepath)
-                    # Cleanup
                     import shutil
                     shutil.rmtree(tempdir, ignore_errors=True)
                     return result
             except ImportError:
                 pass
 
-            # Fallback: try reading as plain text
             logger.warning("⚠️ MOBI support limited. Install 'mobi' package for better results: pip install mobi")
             return self.extract_from_text(file_path)
 
@@ -1161,11 +1139,13 @@ class OCRScanner:
             return ""
 
     # ============================================================
-    # OCR HELPERS
+    # OCR HELPERS (Tesseract only — v3.0)
     # ============================================================
 
     def _ocr_pdf_page(self, pdf_path: str, page_num: int) -> str:
         """Single PDF page ko image me convert karke OCR lagao."""
+        if not self.tesseract_available:
+            return ""
         try:
             from pdf2image import convert_from_path
             images = convert_from_path(
@@ -1175,14 +1155,14 @@ class OCRScanner:
                 dpi=200,
             )
             if images:
-                img_path = f"uploads/temp_page_{page_num}.png"
+                # 🛡️ FIX F-S5: Use TEMP_DIR (no hardcoded paths)
+                img_path = str(TEMP_DIR / f"temp_page_{page_num}_{uuid.uuid4().hex[:6]}.png")
                 images[0].save(img_path, 'PNG')
-                text = self._tesseract_ocr(img_path)
-                if not text:
-                    results = self.reader.readtext(img_path)
-                    text = "\n".join([t for (_, t, c) in results if c > 0.3])
-                if os.path.exists(img_path):
-                    os.remove(img_path)
+                try:
+                    img = Image.open(img_path)
+                    text = _tesseract_ocr_image(img, self.languages)
+                finally:
+                    _secure_cleanup(img_path)
                 return text
         except ImportError:
             logger.warning("⚠️ pdf2image not installed. Skipping OCR for scanned pages.")
@@ -1192,36 +1172,25 @@ class OCRScanner:
 
     def _ocr_entire_pdf(self, pdf_path: str) -> str:
         """Pure OCR fallback - jab PyPDF2 bilkul kaam na kare."""
+        if not self.tesseract_available:
+            return ""
         try:
             from pdf2image import convert_from_path
             images = convert_from_path(pdf_path, dpi=200)
             all_text = ""
             for i, img in enumerate(images):
-                img_path = f"uploads/temp_page_{i}.png"
+                # 🛡️ FIX F-S5: Use TEMP_DIR
+                img_path = str(TEMP_DIR / f"temp_page_{i}_{uuid.uuid4().hex[:6]}.png")
                 img.save(img_path, 'PNG')
-                page_text = self._tesseract_ocr(img_path)
-                if not page_text:
-                    results = self.reader.readtext(img_path)
-                    page_text = "\n".join([t for (_, t, c) in results if c > 0.3])
-                all_text += f"\n--- Page {i+1} (OCR) ---\n{page_text}\n"
-                if os.path.exists(img_path):
-                    os.remove(img_path)
+                try:
+                    page_text = _tesseract_ocr_image(img, self.languages)
+                finally:
+                    _secure_cleanup(img_path)
+                if page_text:
+                    all_text += f"\n--- Page {i+1} (OCR) ---\n{page_text}\n"
             return all_text
         except Exception as e:
             logger.error(f"❌ Full PDF OCR failed: {e}")
-            return ""
-
-    def _tesseract_ocr(self, img_path: str) -> str:
-        """Fast OCR using pytesseract (instant, no model download)."""
-        if not self.tesseract_available:
-            return ""
-        try:
-            import pytesseract
-            img = Image.open(img_path)
-            text = pytesseract.image_to_string(img, lang='+'.join(self.languages))
-            return text if text and len(text.strip()) > 5 else ""
-        except Exception as e:
-            logger.debug(f"Pytesseract OCR skipped: {e}")
             return ""
 
     # ============================================================
@@ -1232,8 +1201,9 @@ class OCRScanner:
         """Extracted text ko clean karo."""
         if not text:
             return ""
-        text = re.sub(r'\s+', ' ', text)
-        text = re.sub(r' +', ' ', text)
+        # Remove excessive whitespace but preserve paragraph breaks
+        text = re.sub(r'[ \t]+', ' ', text)
+        text = re.sub(r'\n{3,}', '\n\n', text)
         return text.strip()
 
     @staticmethod

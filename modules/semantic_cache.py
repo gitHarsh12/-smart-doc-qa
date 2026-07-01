@@ -1,288 +1,381 @@
 """
 =============================================================
-MODULE 3: Semantic Cache (Speed & Cost Optimizer)
+MODULE 3: Semantic Cache (Zero-latency Q&A repeat hits)
 =============================================================
-Yeh module same sawalon ke liye purane jawabon ko yaad rakhta hai.
+When user asks a question similar to one asked before,
+return the cached answer instantly — no LLM call needed!
 
 Features:
-- Semantic matching (Cosine Similarity >= 92%)
-- 0ms latency for cache hits (NO API call!)
-- Cost savings (tokens bachao!)
-- In-memory storage (Python dict)
-- Automatic cache expiration
+- Cosine similarity matching (configurable threshold, default 92%)
+- Per-document hash isolation (cache invalidated on document change)
+- In-memory + disk persistence (survives app restart)
+- Thread-safe via locking
+- LRU eviction (max 100 entries per document)
+- Stats tracking (hits, misses, hit rate)
+
+Usage:
+    from modules.semantic_cache import SemanticCache
+    cache = SemanticCache(similarity_threshold=0.92)
+    cache.set_document_hash("doc_abc123")
+
+    query_vector = [0.1, 0.2, ...]
+    result = cache.lookup(query_vector)
+    if result:
+        return result.answer  # Cache hit!
+    else:
+        answer = llm.chat(...)
+        cache.add("What is X?", query_vector, answer)
+
+Algorithm:
+    - Stores query vectors + answers in memory (numpy array)
+    - On lookup: cosine similarity vs all cached queries
+    - If best similarity >= threshold: cache hit
+    - Else: cache miss → call LLM → store result
 =============================================================
 """
 
 import os
-import hashlib
-import logging
+import json
 import time
-from typing import List, Dict, Optional, Tuple
-from dataclasses import dataclass, field
+import logging
+import threading
+import hashlib
+from dataclasses import dataclass, asdict
+from typing import Optional, List, Dict, Tuple
+from pathlib import Path
 
 import numpy as np
-from sklearn.metrics.pairwise import cosine_similarity
 
 logger = logging.getLogger(__name__)
 
 
+# ============================================================
+# Cache entry data class
+# ============================================================
 @dataclass
 class CacheEntry:
-    """
-    Ek cache entry ka data structure.
-
-    Attributes:
-        query_text: Original sawal
-        query_vector: Sawaal ka embedding vector
-        answer: System ka jawab
-        timestamp: Kab cache me add kiya
-        hit_count: Kitni baar yeh cache use hua
-    """
+    """One cached Q&A pair."""
     query_text: str
     query_vector: List[float]
     answer: str
-    timestamp: float = 0.0
+    timestamp: float
     hit_count: int = 0
 
-    def __post_init__(self):
-        if self.timestamp == 0.0:
-            self.timestamp = time.time()
+    def to_dict(self) -> Dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: Dict) -> "CacheEntry":
+        return cls(**d)
 
 
+@dataclass
+class CacheLookupResult:
+    """Result of a cache lookup."""
+    answer: str
+    similarity: float
+    query_text: str
+    timestamp: float
+
+
+# ============================================================
+# Semantic Cache
+# ============================================================
 class SemanticCache:
+    """Cosine-similarity-based Q&A cache.
+
+    Args:
+        similarity_threshold: Min cosine similarity for cache hit (0.0 - 1.0).
+            0.92 = very strict (only near-identical questions hit cache).
+            0.85 = moderate (similar questions hit cache).
+            0.70 = loose (risky — different questions may hit cache).
+        max_size: Max entries per document (LRU eviction when full).
+        persist_path: Path to JSON file for disk persistence (None = no persistence).
     """
-    Silicon Valley ka sabse bada hack - Semantic Caching!
-
-    🛡️ Hardened with:
-    - F-20: Vectorized cosine similarity (O(N) → 1 matrix multiply)
-    - F-05: Document hash in cache key (no stale answers after doc change)
-
-    Kaise kaam karta hai:
-    1. User ne sawal pucha → Query vector banao
-    2. Cache me har entry ke vector se Cosine Similarity check karo
-       (ab matrix multiply se — bahut fast)
-    3. Agar kisi entry ka similarity >= 92% → CACHE HIT!
-       → Bina API call kiye turant jawab do (0ms)
-    4. Agar koi match nahi → CACHE MISS → Module 4 pe jao
-    """
-
-    # Default similarity threshold (92%)
-    DEFAULT_THRESHOLD = 0.92
 
     def __init__(
         self,
-        similarity_threshold: float = None,
-        max_cache_size: int = 100,
-        ttl_seconds: int = 86400,  # 24 hours
-        document_hash: str = "",
+        similarity_threshold: float = 0.92,
+        max_size: int = 100,
+        persist_path: Optional[str] = None,
     ):
-        """
-        Initialize Semantic Cache.
+        # Validate threshold
+        if not 0.0 <= similarity_threshold <= 1.0:
+            raise ValueError(f"similarity_threshold must be 0.0-1.0, got {similarity_threshold}")
+        self.similarity_threshold = float(similarity_threshold)
+        self.max_size = max(1, int(max_size))
 
-        Args:
-            similarity_threshold: Kitna % match chahiye cache hit ke liye (default: 0.92)
-            max_cache_size: Maximum cache entries (memory control)
-            ttl_seconds: Cache entry kitni der valid hai (default: 24 hours)
-            document_hash: Current document ka hash — agar badle to cache invalidate.
-        """
-        self.similarity_threshold = similarity_threshold or float(
-            os.getenv("CACHE_SIMILARITY_THRESHOLD", self.DEFAULT_THRESHOLD)
-        )
-        self.max_cache_size = max_cache_size
-        self.ttl_seconds = ttl_seconds
-        # 🛡️ F-05: Document hash for invalidation
-        self.document_hash = document_hash
+        # Use temp dir if no path given (Streamlit Cloud safe)
+        if persist_path is None:
+            import tempfile
+            persist_dir = Path(tempfile.gettempdir()) / "rag_app"
+            persist_dir.mkdir(parents=True, exist_ok=True)
+            persist_path = str(persist_dir / "semantic_cache.json")
 
-        # In-memory cache storage
-        self.cache: Dict[str, CacheEntry] = {}
+        self.persist_path = Path(persist_path)
 
-        # 🛡️ F-20: Cached vectors matrix (rebuilt on add/clear)
-        self._vectors_matrix: Optional[np.ndarray] = None
-        self._cache_keys_in_order: List[str] = []  # for index → key mapping
-        self._vectors_dirty = True
+        # Per-document cache: {doc_hash: List[CacheEntry]}
+        self._caches: Dict[str, List[CacheEntry]] = {}
+        self._current_doc_hash: str = "default"
+        self._lock = threading.Lock()
 
-        # Stats tracking
-        self.stats = {
-            "hits": 0,
-            "misses": 0,
-            "total_queries": 0,
+        # Stats
+        self._stats = {
+            "cache_hits": 0,
+            "cache_misses": 0,
+            "total_lookups": 0,
         }
+
+        # Load from disk
+        self._load_from_disk()
 
         logger.info(
             f"🛡️ Semantic Cache initialized: "
-            f"threshold={self.similarity_threshold*100:.0f}%, "
-            f"max_size={max_cache_size}, ttl={ttl_seconds}s, "
-            f"doc_hash={document_hash[:8] or 'none'}"
+            f"threshold={self.similarity_threshold:.2f}, "
+            f"max_size={self.max_size}, "
+            f"persist_path={self.persist_path}"
         )
 
-    def set_document_hash(self, document_hash: str) -> None:
-        """Update document hash and clear cache if it changed (F-05)."""
-        if self.document_hash and self.document_hash != document_hash:
-            logger.info("🔄 Document changed — clearing cache (F-05 fix)")
-            self.clear()
-        self.document_hash = document_hash
-
-    def _rebuild_vectors_matrix(self) -> None:
-        """🛡️ F-20: Build a (N, D) matrix from all cached vectors."""
-        if not self.cache:
-            self._vectors_matrix = None
-            self._cache_keys_in_order = []
-            self._vectors_dirty = False
-            return
-        # Preserve insertion order for index mapping
-        self._cache_keys_in_order = list(self.cache.keys())
-        vectors = [self.cache[k].query_vector for k in self._cache_keys_in_order]
-        self._vectors_matrix = np.array(vectors, dtype=np.float32)
-        # Normalize rows for cosine similarity via dot product
-        norms = np.linalg.norm(self._vectors_matrix, axis=1, keepdims=True)
-        norms[norms == 0] = 1.0  # avoid div by zero
-        self._vectors_matrix = self._vectors_matrix / norms
-        self._vectors_dirty = False
-
-    def lookup(self, query_vector: List[float]) -> Optional[CacheEntry]:
-        """
-        Cache me check karo - kya yeh sawal pehle bhi pucha gaya?
-
-        🛡️ F-20: Vectorized lookup — single matrix multiply instead of N loops.
+    # ============================================================
+    # Document hash management
+    # ============================================================
+    def set_document_hash(self, doc_hash: str) -> None:
+        """Set the current document hash (isolates cache per document).
 
         Args:
-            query_vector: User query ka embedding vector
+            doc_hash: Any string uniquely identifying the current document.
+                      (e.g., SHA256 of file content, first 16 chars)
+        """
+        if not doc_hash:
+            doc_hash = "default"
+        with self._lock:
+            if doc_hash != self._current_doc_hash:
+                logger.info(f"🔄 Switching cache document: {self._current_doc_hash} → {doc_hash}")
+                self._current_doc_hash = doc_hash
+                if doc_hash not in self._caches:
+                    self._caches[doc_hash] = []
+
+    def invalidate_document(self, doc_hash: str) -> None:
+        """Remove all cache entries for a specific document."""
+        with self._lock:
+            if doc_hash in self._caches:
+                count = len(self._caches[doc_hash])
+                del self._caches[doc_hash]
+                logger.info(f"🗑️ Invalidated {count} cache entries for document {doc_hash}")
+                self._save_to_disk()
+
+    def clear_all(self) -> None:
+        """Clear all cache entries (all documents)."""
+        with self._lock:
+            total = sum(len(entries) for entries in self._caches.values())
+            self._caches.clear()
+            self._stats["cache_hits"] = 0
+            self._stats["cache_misses"] = 0
+            self._stats["total_lookups"] = 0
+            logger.info(f"🗑️ Cleared all cache ({total} entries removed)")
+            self._save_to_disk()
+
+    # ============================================================
+    # Lookup (cache hit check)
+    # ============================================================
+    def lookup(self, query_vector: List[float]) -> Optional[CacheLookupResult]:
+        """Check if a similar query exists in cache.
+
+        Args:
+            query_vector: Embedding of the user's query.
 
         Returns:
-            CacheEntry agar match mila (>= 92%), else None
+            CacheLookupResult if cache hit, None if miss.
         """
-        self.stats["total_queries"] += 1
+        with self._lock:
+            self._stats["total_lookups"] += 1
 
-        if not self.cache:
-            self.stats["misses"] += 1
-            logger.info("📭 Cache empty → MISS")
-            return None
+            entries = self._caches.get(self._current_doc_hash, [])
+            if not entries:
+                self._stats["cache_misses"] += 1
+                return None
 
-        # Check for expired entries first
-        self._cleanup_expired()
-        if not self.cache:
-            self.stats["misses"] += 1
-            return None
+            # Build matrix of cached query vectors
+            cached_vectors = np.array([e.query_vector for e in entries], dtype=np.float32)
+            query_np = np.array([query_vector], dtype=np.float32)
 
-        # 🛡️ F-20: Rebuild matrix if dirty
-        if self._vectors_dirty:
-            self._rebuild_vectors_matrix()
+            # Normalize for cosine similarity
+            cached_norms = np.linalg.norm(cached_vectors, axis=1, keepdims=True)
+            cached_norms[cached_norms == 0] = 1.0  # Avoid division by zero
+            cached_normalized = cached_vectors / cached_norms
 
-        # Query vector normalize
-        q = np.array(query_vector, dtype=np.float32)
-        q_norm = np.linalg.norm(q)
-        if q_norm == 0:
-            self.stats["misses"] += 1
-            return None
-        q = q / q_norm
+            query_norm = np.linalg.norm(query_np)
+            if query_norm == 0:
+                self._stats["cache_misses"] += 1
+                return None
+            query_normalized = query_np / query_norm
 
-        # 🛡️ F-20: Batch cosine similarity — 1 matmul, not N loops
-        similarities = self._vectors_matrix @ q  # (N,) vector
-        best_idx = int(np.argmax(similarities))
-        best_similarity = float(similarities[best_idx])
+            # Compute cosine similarities
+            similarities = (cached_normalized @ query_normalized.T).flatten()
 
-        if best_similarity >= self.similarity_threshold:
-            best_key = self._cache_keys_in_order[best_idx]
-            best_match = self.cache[best_key]
-            self.stats["hits"] += 1
-            best_match.hit_count += 1
-            logger.info(
-                f"🎯 CACHE HIT! Similarity: {best_similarity*100:.1f}% "
-                f"(>= {self.similarity_threshold*100:.0f}%)"
-            )
-            logger.info(f"   Cached Q: '{best_match.query_text[:50]}...'")
-            return best_match
-        else:
-            self.stats["misses"] += 1
-            logger.info(
-                f"📭 CACHE MISS. Best similarity: {best_similarity*100:.1f}% "
-                f"(< {self.similarity_threshold*100:.0f}%)"
-            )
-            return None
+            # Find best match
+            best_idx = int(np.argmax(similarities))
+            best_sim = float(similarities[best_idx])
 
+            if best_sim >= self.similarity_threshold:
+                entry = entries[best_idx]
+                entry.hit_count += 1
+                self._stats["cache_hits"] += 1
+                logger.info(
+                    f"⚡ CACHE HIT! similarity={best_sim:.3f} "
+                    f"(threshold={self.similarity_threshold:.2f}), "
+                    f"hits={entry.hit_count}"
+                )
+                # Move to end (LRU)
+                entries.pop(best_idx)
+                entries.append(entry)
+                # Persist asynchronously (best effort)
+                try:
+                    self._save_to_disk()
+                except Exception as e:
+                    logger.warning(f"Cache persist failed (non-fatal): {e}")
+                return CacheLookupResult(
+                    answer=entry.answer,
+                    similarity=best_sim,
+                    query_text=entry.query_text,
+                    timestamp=entry.timestamp,
+                )
+            else:
+                self._stats["cache_misses"] += 1
+                logger.debug(
+                    f"Cache miss: best_sim={best_sim:.3f} "
+                    f"< threshold={self.similarity_threshold:.2f}"
+                )
+                return None
+
+    # ============================================================
+    # Add new entry
+    # ============================================================
     def add(
         self,
         query_text: str,
         query_vector: List[float],
-        answer: str
+        answer: str,
     ) -> None:
-        """
-        Naya sawal-jawab pair cache me add karo.
+        """Add a new Q&A pair to the cache.
 
-        🛡️ F-05: Cache key includes document hash.
+        Args:
+            query_text: Original user question
+            query_vector: Embedding of the question
+            answer: LLM-generated answer
         """
-        # Cache size check - agar full hai toh sabse purana delete karo
-        if len(self.cache) >= self.max_cache_size:
-            self._evict_oldest()
+        if not query_text or not query_vector or not answer:
+            return
 
-        # 🛡️ F-05: Cache key includes document hash
-        # Same question on different document → different cache entry
-        text_hash = hashlib.sha256(query_text.encode()).hexdigest()[:16]
-        cache_key = f"doc_{self.document_hash[:8]}_q_{text_hash}"
+        # Cap entry size to prevent memory bloat
+        if len(query_text) > 5000:
+            query_text = query_text[:5000]
+        if len(answer) > 50000:
+            answer = answer[:50000]
 
         entry = CacheEntry(
             query_text=query_text,
-            query_vector=query_vector,
+            query_vector=list(query_vector),
             answer=answer,
+            timestamp=time.time(),
+            hit_count=0,
         )
 
-        self.cache[cache_key] = entry
-        # 🛡️ F-20: Mark matrix dirty for rebuild on next lookup
-        self._vectors_dirty = True
+        with self._lock:
+            entries = self._caches.setdefault(self._current_doc_hash, [])
+            entries.append(entry)
+
+            # LRU eviction: remove oldest if over capacity
+            while len(entries) > self.max_size:
+                evicted = entries.pop(0)
+                logger.debug(f"LRU evicted cache entry (hits={evicted.hit_count})")
+
+            # Persist
+            try:
+                self._save_to_disk()
+            except Exception as e:
+                logger.warning(f"Cache persist failed (non-fatal): {e}")
+
         logger.info(
-            f"📝 Cached: '{query_text[:40]}...' "
-            f"(Cache size: {len(self.cache)}/{self.max_cache_size})"
+            f"➕ Added cache entry: '{query_text[:50]}...' "
+            f"(total in current doc: {len(self._caches.get(self._current_doc_hash, []))})"
         )
 
-    def clear(self):
-        """Poori cache khaali karo."""
-        self.cache.clear()
-        self._vectors_matrix = None
-        self._cache_keys_in_order = []
-        self._vectors_dirty = True
-        logger.info("🗑️ Cache cleared")
-
+    # ============================================================
+    # Stats
+    # ============================================================
     def get_stats(self) -> Dict:
-        """Cache statistics return karo."""
-        hit_rate = 0.0
-        if self.stats["total_queries"] > 0:
-            hit_rate = (self.stats["hits"] / self.stats["total_queries"]) * 100
+        """Get cache statistics."""
+        with self._lock:
+            total_entries = sum(len(entries) for entries in self._caches.values())
+            current_doc_entries = len(self._caches.get(self._current_doc_hash, []))
+            total_lookups = self._stats["total_lookups"]
+            hit_rate = (
+                (self._stats["cache_hits"] / total_lookups * 100)
+                if total_lookups > 0 else 0.0
+            )
+            return {
+                "cache_hits": self._stats["cache_hits"],
+                "cache_misses": self._stats["cache_misses"],
+                "total_lookups": total_lookups,
+                "hit_rate_pct": round(hit_rate, 2),
+                "total_entries": total_entries,
+                "current_doc_entries": current_doc_entries,
+                "current_doc_hash": self._current_doc_hash,
+                "similarity_threshold": self.similarity_threshold,
+                "max_size": self.max_size,
+            }
 
-        return {
-            "cache_size": len(self.cache),
-            "max_size": self.max_cache_size,
-            "similarity_threshold": self.similarity_threshold,
-            "total_queries": self.stats["total_queries"],
-            "cache_hits": self.stats["hits"],
-            "cache_misses": self.stats["misses"],
-            "hit_rate_percent": round(hit_rate, 1),
-            "document_hash": self.document_hash[:8] if self.document_hash else "",
-        }
+    # ============================================================
+    # Disk persistence
+    # ============================================================
+    def _save_to_disk(self) -> None:
+        """Save cache to disk (atomic via temp file)."""
+        try:
+            serializable = {
+                "stats": self._stats,
+                "current_doc_hash": self._current_doc_hash,
+                "caches": {
+                    doc_hash: [entry.to_dict() for entry in entries]
+                    for doc_hash, entries in self._caches.items()
+                },
+            }
+            tmp_file = self.persist_path.with_suffix('.tmp')
+            with open(tmp_file, 'w', encoding='utf-8') as f:
+                json.dump(serializable, f, ensure_ascii=False, indent=2)
+            tmp_file.replace(self.persist_path)
+        except (OSError, TypeError, ValueError) as e:
+            logger.warning(f"Cache save failed: {e}")
 
-    def _cleanup_expired(self):
-        """Expire ho chuke entries delete karo."""
-        current_time = time.time()
-        expired_keys = [
-            key for key, entry in self.cache.items()
-            if current_time - entry.timestamp > self.ttl_seconds
-        ]
+    def _load_from_disk(self) -> None:
+        """Load cache from disk (best effort)."""
+        try:
+            if not self.persist_path.exists():
+                return
+            with open(self.persist_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            self._stats = data.get("stats", self._stats)
+            self._current_doc_hash = data.get("current_doc_hash", "default")
+            for doc_hash, entries_data in data.get("caches", {}).items():
+                self._caches[doc_hash] = [
+                    CacheEntry.from_dict(e) for e in entries_data
+                ]
+            total = sum(len(entries) for entries in self._caches.values())
+            logger.info(f"📂 Loaded {total} cache entries from disk ({len(self._caches)} documents)")
+        except (OSError, json.JSONDecodeError, TypeError, ValueError) as e:
+            logger.warning(f"Cache load failed ({e}) — starting fresh")
+            self._caches = {}
 
-        for key in expired_keys:
-            del self.cache[key]
 
-        if expired_keys:
-            self._vectors_dirty = True  # 🛡️ F-20: matrix needs rebuild
-            logger.info(f"⏰ Removed {len(expired_keys)} expired cache entries")
+# ============================================================
+# Singleton
+# ============================================================
+_semantic_cache: Optional[SemanticCache] = None
 
-    def _evict_oldest(self):
-        """Sabse purani entry delete karo (LRU eviction)."""
-        if not self.cache:
-            return
 
-        oldest_key = min(
-            self.cache.keys(),
-            key=lambda k: self.cache[k].timestamp
-        )
-        del self.cache[oldest_key]
-        self._vectors_dirty = True  # 🛡️ F-20: matrix needs rebuild
-        logger.info("♻️ Evicted oldest cache entry (cache full)")
+def get_semantic_cache(threshold: float = 0.92) -> SemanticCache:
+    """Get singleton SemanticCache instance."""
+    global _semantic_cache
+    if _semantic_cache is None:
+        _semantic_cache = SemanticCache(similarity_threshold=threshold)
+    return _semantic_cache
