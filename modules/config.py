@@ -73,10 +73,17 @@ class AppConfig:
     FAISS_META_FILENAME: str = "faiss_meta.json"
     CACHE_FILENAME: str = "semantic_cache.json"
 
-    # ── Auth (F-03) ──
+    # -- Auth (F-03) --
     ALLOWED_EMAILS_ENV: str = "RAG_ALLOWED_EMAILS"
     ADMIN_EMAILS_ENV: str = "RAG_ADMIN_EMAILS"
     PASSWORD_HASH_ROUNDS: int = 10000  # SHA256 iterations
+
+    # -- Hardcoded Admin (v3.0.6) --
+    # Sirf yeh email admin hoga, chahe koi bhi pehle register kare.
+    # Auto-first-user-admin feature HATA diya gaya hai.
+    # Password bhi yahi fix hai (case-sensitive).
+    HARDCODED_ADMIN_EMAIL: str = "bajiprabhu2915@gmail.com"
+    HARDCODED_ADMIN_PASSWORD: str = "Mumbai"
 
     # ── Observability (F-16, F-17) ──
     LOG_LEVEL: str = "INFO"

@@ -188,20 +188,60 @@ def _get_allowed_emails_hint() -> str:
 
 
 def _is_admin_email(email: str) -> bool:
-    """Check if email is in admin list."""
+    """Check if email is admin.
+
+    v3.0.6: Admin logic changed!
+    - OLD: First registered user auto-becomes admin (INSECURE!)
+    - NEW: Only HARDCODED_ADMIN_EMAIL is admin (from config.py)
+    - OR emails listed in RAG_ADMIN_EMAILS env var
+    - No other user can become admin
+
+    Args:
+        email: User email (lowercase)
+
+    Returns:
+        True if email is admin, False otherwise
+    """
     if not email:
         return False
-    admins = os.getenv("RAG_ADMIN_EMAILS", "").strip()
-    if not admins:
-        # First registered user becomes admin automatically
-        users = _read_users()
-        if len(users) == 0:
+
+    email_lower = email.lower().strip()
+
+    # Check 1: Hardcoded admin email (from config.py)
+    if email_lower == CONFIG.HARDCODED_ADMIN_EMAIL.lower():
+        return True
+
+    # Check 2: RAG_ADMIN_EMAILS env var (comma-separated list)
+    admins = os.getenv(CONFIG.ADMIN_EMAILS_ENV, "").strip()
+    if admins:
+        admin_list = [e.strip().lower() for e in admins.split(",") if e.strip()]
+        if email_lower in admin_list:
             return True
-        # Otherwise, the first user in the users file is admin
-        first_email = sorted(users.keys())[0]
-        return email.lower() == first_email.lower()
-    admin_list = [e.strip().lower() for e in admins.split(",") if e.strip()]
-    return email.lower() in admin_list
+
+    # NOT admin — no auto-first-user-admin anymore
+    return False
+
+
+def _is_hardcoded_admin(email: str, password: str) -> bool:
+    """Check if email+password matches the hardcoded admin credentials.
+
+    This is used to allow the admin to login even if not yet registered,
+    OR to override the stored password if admin wants to change it.
+
+    Args:
+        email: User email
+        password: Plain text password
+
+    Returns:
+        True if matches hardcoded admin credentials
+    """
+    if not email or not password:
+        return False
+    email_lower = email.lower().strip()
+    return (
+        email_lower == CONFIG.HARDCODED_ADMIN_EMAIL.lower()
+        and password == CONFIG.HARDCODED_ADMIN_PASSWORD
+    )
 
 
 def _is_valid_email(email: str) -> bool:
@@ -256,6 +296,63 @@ def register_or_login(email: str, password: str) -> Tuple[bool, str]:
     users = _read_users()
     now = int(time.time())
 
+    # ============================================================
+    # v3.0.6: Hardcoded admin special handling
+    # ============================================================
+    # Admin email + password match karte hain toh:
+    # 1. Agar admin pehle se registered hai with different password
+    #    -> Update password to hardcoded one
+    # 2. Agar admin registered nahi hai
+    #    -> Auto-register with hardcoded credentials
+    # 3. Admin ka is_admin HAMESHA True hoga
+    # ============================================================
+    if _is_hardcoded_admin(email, password):
+        if email in users:
+            # Admin exists — verify password (allow both stored + hardcoded)
+            user = users[email]
+            stored_ok = _verify_password(password, user["password_hash"], user["salt"])
+            if not stored_ok:
+                # Maybe admin changed password? Force update to hardcoded
+                logger.info(f"Admin password mismatch, updating to hardcoded for {email}")
+                hashed, salt = _hash_password(password)
+                user["password_hash"] = hashed
+                user["salt"] = salt
+            # Force admin = True
+            user["is_admin"] = True
+            user["last_login"] = now
+            user["last_active"] = now
+            user["login_count"] = user.get("login_count", 0) + 1
+            users[email] = user
+            _write_users(users)
+            st.session_state["user_email"] = email
+            st.session_state["user_is_admin"] = True
+            _log_activity_internal(email, "admin_login")
+            logger.info(f"Admin logged in: {email}")
+            return True, f"Welcome Admin, {email}! Logged in successfully."
+        else:
+            # Admin not registered — auto-register
+            hashed, salt = _hash_password(password)
+            users[email] = {
+                "email": email,
+                "password_hash": hashed,
+                "salt": salt,
+                "is_admin": True,  # ALWAYS admin
+                "first_seen": now,
+                "last_login": now,
+                "last_active": now,
+                "login_count": 1,
+                "query_count": 0,
+            }
+            _write_users(users)
+            st.session_state["user_email"] = email
+            st.session_state["user_is_admin"] = True
+            _log_activity_internal(email, "admin_registered")
+            logger.info(f"Admin auto-registered: {email}")
+            return True, f"Welcome Admin, {email}! Account created successfully."
+
+    # ============================================================
+    # Normal user flow (non-admin)
+    # ============================================================
     if email in users:
         # Existing user — verify password
         user = users[email]
@@ -266,18 +363,19 @@ def register_or_login(email: str, password: str) -> Tuple[bool, str]:
         user["last_login"] = now
         user["last_active"] = now
         user["login_count"] = user.get("login_count", 0) + 1
+        # 🛡️ v3.0.6: Re-check admin status (in case config changed)
+        user["is_admin"] = _is_admin_email(email)
         users[email] = user
         _write_users(users)
         logger.info(f"User logged in: {email}")
     else:
-        # New user — register
-        is_first_user = len(users) == 0
+        # New user — register (NEVER admin unless hardcoded admin)
         hashed, salt = _hash_password(password)
         users[email] = {
             "email": email,
             "password_hash": hashed,
             "salt": salt,
-            "is_admin": is_first_user or _is_admin_email(email),
+            "is_admin": _is_admin_email(email),  # False for normal users
             "first_seen": now,
             "last_login": now,
             "last_active": now,
