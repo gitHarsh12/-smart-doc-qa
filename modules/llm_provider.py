@@ -362,25 +362,82 @@ def get_embedding_strategy() -> Dict:
     """
     Embedding ke liye best strategy decide karo.
 
-    🔥 KEY LOGIC: User ke paas jo bhi key ho, embeddings kaam kare!
+    🧠 v3.0.3: LOCAL EMBEDDINGS FIRST (user preference)!
+    User ne kaha ki local embeddings chahiye (no API key needed).
 
-    Strategy:
-    1. NVIDIA key hai → NVIDIA embeddings (best, cloud-based)
-    2. Koi bhi key hai → Local sentence-transformers (no API needed!)
+    Strategy Priority:
+    1. EMBEDDING_PROVIDER=local → Force local (if sentence-transformers installed)
+    2. EMBEDDING_PROVIDER=nvidia → Force NVIDIA cloud
+    3. EMBEDDING_PROVIDER=auto (default) → Prefer local if available, else NVIDIA
+
+    Local embeddings (all-MiniLM-L6-v2):
+    - 384-dimensional vectors
+    - ~80MB model (downloaded once, cached forever)
+    - Runs on CPU (no GPU needed)
+    - NO API key needed!
+    - Works offline after first download
+
+    NVIDIA cloud embeddings:
+    - 1024-dimensional vectors
+    - Needs NVIDIA_API_KEY
+    - Better quality but requires internet
     """
     keys = detect_available_keys()
 
-    if keys.get("nvidia"):
-        return {
-            "method": "nvidia_cloud",
-            "display": "NVIDIA Cloud Embeddings",
-            "model": "nvidia/nv-embedqa-e5-v5",
-            "dimension": 1024,
-            "icon": "🟢",
-            "needs_key": "NVIDIA_API_KEY",
-            "cost": "FREE",
-        }
-    else:
+    # Check what's available
+    local_available = False
+    local_import_error = None
+    try:
+        import sentence_transformers  # noqa: F401
+        local_available = True
+        logger.info("✅ sentence-transformers is importable!")
+    except ImportError as e:
+        local_import_error = f"ImportError: {e}"
+        logger.warning(f"⚠️ sentence-transformers NOT installed! Error: {e}")
+    except Exception as e:
+        local_import_error = f"{type(e).__name__}: {e}"
+        logger.warning(f"⚠️ sentence-transformers import failed! Error: {local_import_error}")
+
+    nvidia_available = keys.get("nvidia", False)
+
+    # Read user preference from env (default: auto)
+    preference = os.getenv("EMBEDDING_PROVIDER", "auto").lower().strip()
+
+    # Strategy 1: User forced local
+    if preference == "local":
+        if local_available:
+            logger.info("🧠 Embedding strategy: LOCAL (forced by EMBEDDING_PROVIDER=local)")
+            return {
+                "method": "local_sentence_transformer",
+                "display": "Local Embeddings (Free!)",
+                "model": "all-MiniLM-L6-v2",
+                "dimension": 384,
+                "icon": "💻",
+                "needs_key": "None — Runs locally!",
+                "cost": "FREE — No API needed!",
+            }
+        else:
+            logger.warning("⚠️ EMBEDDING_PROVIDER=local but sentence-transformers not installed!")
+
+    # Strategy 2: User forced NVIDIA
+    if preference == "nvidia":
+        if nvidia_available:
+            logger.info("🟢 Embedding strategy: NVIDIA CLOUD (forced by EMBEDDING_PROVIDER=nvidia)")
+            return {
+                "method": "nvidia_cloud",
+                "display": "NVIDIA Cloud Embeddings",
+                "model": "nvidia/nv-embedqa-e5-v5",
+                "dimension": 1024,
+                "icon": "🟢",
+                "needs_key": "NVIDIA_API_KEY",
+                "cost": "FREE",
+            }
+        else:
+            logger.warning("⚠️ EMBEDDING_PROVIDER=nvidia but NVIDIA_API_KEY not set!")
+
+    # Strategy 3: Auto mode — PREFER LOCAL (v3.0.3 change)
+    if local_available:
+        logger.info("🧠 Embedding strategy: LOCAL (auto — no API key needed!)")
         return {
             "method": "local_sentence_transformer",
             "display": "Local Embeddings (Free!)",
@@ -390,6 +447,32 @@ def get_embedding_strategy() -> Dict:
             "needs_key": "None — Runs locally!",
             "cost": "FREE — No API needed!",
         }
+
+    # Strategy 4: Fall back to NVIDIA cloud
+    if nvidia_available:
+        logger.info("🟢 Embedding strategy: NVIDIA CLOUD (sentence-transformers not installed)")
+        return {
+            "method": "nvidia_cloud",
+            "display": "NVIDIA Cloud Embeddings",
+            "model": "nvidia/nv-embedqa-e5-v5",
+            "dimension": 1024,
+            "icon": "🟢",
+            "needs_key": "NVIDIA_API_KEY",
+            "cost": "FREE",
+        }
+
+    # Strategy 5: Neither available — error
+    logger.error("❌ No embedding strategy available!")
+    error_detail = local_import_error if local_import_error else "sentence-transformers not installed"
+    return {
+        "method": "unavailable",
+        "display": "❌ No Embeddings Available",
+        "model": "None",
+        "dimension": 0,
+        "icon": "❌",
+        "needs_key": "Install sentence-transformers OR add NVIDIA_API_KEY",
+        "cost": f"Error: {error_detail}",
+    }
 
 
 # ============================================================
@@ -728,29 +811,58 @@ class EmbeddingProvider:
                 logger.info(f"📦 Loading local model: {self.model_name}")
                 self._local_model = SentenceTransformer(self.model_name)
                 logger.info("✅ Local embedding model loaded!")
-            except ImportError:
+            except ImportError as e:
                 logger.error(
-                    "❌ sentence-transformers not installed! "
-                    "Run: pip install sentence-transformers"
+                    f"❌ sentence-transformers not installed! Error: {e}\n"
+                    f"Fix: pip install sentence-transformers torch"
                 )
-                raise
+                raise ImportError(
+                    f"sentence-transformers not installed! Error: {e}\n"
+                    f"Fix: Check Streamlit Cloud logs — package may have failed to install.\n"
+                    f"Local install: pip install sentence-transformers torch"
+                ) from e
+            except Exception as e:
+                logger.error(f"❌ sentence-transformers model load failed: {e}")
+                raise RuntimeError(
+                    f"Failed to load sentence-transformers model: {e}\n"
+                    f"This might be a numpy/torch version conflict.\n"
+                    f"Try: pip install --upgrade sentence-transformers torch numpy"
+                ) from e
         return self._local_model
 
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
         """Document chunks ko vectors me badlo."""
         if self.method == "nvidia_cloud":
             return self._embed_nvidia(texts, prefix="passage")
-        else:
+        elif self.method == "local_sentence_transformer":
             return self._embed_local(texts)
+        else:
+            # 🛡️ v3.0.4: Better error message with actual import error
+            error_detail = self.strategy.get("cost", "Unknown error")
+            raise RuntimeError(
+                f"❌ No embeddings available!\n\n"
+                f"Reason: {error_detail}\n\n"
+                f"To fix:\n"
+                f"1. Check Streamlit Cloud logs — sentence-transformers may have failed to install\n"
+                f"2. OR add NVIDIA_API_KEY to secrets.toml (cloud embeddings, no torch needed)\n"
+                f"3. OR locally: pip install sentence-transformers torch"
+            )
 
     def embed_query(self, query: str) -> List[float]:
         """User query ko vector me badlo."""
         if self.method == "nvidia_cloud":
             results = self._embed_nvidia([f"query: {query}"])
             return results[0] if results else [0.0] * self.dimension
-        else:
+        elif self.method == "local_sentence_transformer":
             results = self._embed_local([query])
             return results[0] if results else [0.0] * self.dimension
+        else:
+            # 🛡️ v3.0.2: Graceful error for unavailable embeddings
+            raise RuntimeError(
+                "❌ No embeddings available! Either:\n"
+                "1. Add NVIDIA_API_KEY to secrets.toml (recommended)\n"
+                "2. OR install: pip install sentence-transformers torch"
+            )
 
     def _embed_nvidia(self, texts: List[str], prefix: str = "passage") -> List[List[float]]:
         """NVIDIA cloud embedding API call karo."""

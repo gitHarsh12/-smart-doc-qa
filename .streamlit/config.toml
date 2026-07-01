@@ -1,42 +1,19 @@
 # ==============================================================
-# Smart Document Q&A — Streamlit Configuration (v3.0.1)
+# Smart Document Q&A - Streamlit Configuration (v3.0.5 - ASCII Safe)
 # ==============================================================
-# Place at: .streamlit/config.toml
+# Streamlit Cloud optimized - minimal settings to prevent crashes.
 # Doc: https://docs.streamlit.io/library/advanced-features/configuration
-#
-# 🛡️ FIX v3.0.1:
-#   - Removed `serverAddress = ""` (was breaking URL → http://:8501)
-#   - Set `enableStaticServing = false` (no static folder needed)
-#   - Works on Windows, Mac, Linux, Streamlit Cloud, Docker
 # ==============================================================
 
 [server]
-# Bind to all interfaces (works on Windows localhost + Streamlit Cloud)
-address = "0.0.0.0"
 port = 8501
-
-# Increase upload limit to 500MB (allows large PDFs)
 maxUploadSize = 500
-
-# XSRF protection (keep enabled for security)
-enableXsrfProtection = true
-
-# CORS enabled (needed for Streamlit Cloud + local dev)
-enableCORS = true
-
-# Don't auto-reload on file changes (production)
+headless = true
+enableCORS = false
+enableXsrfProtection = false
 runOnSave = false
 
-# 🛡️ FIX v3.0.1: Disable static serving (we don't use static files)
-# This removes the "no static folder found" warning.
-enableStaticServing = false
-
-# Headless mode (don't auto-open browser — prevents issues on some systems)
-# Set to false if you want browser to auto-open on `streamlit run`
-headless = false
-
 [theme]
-# Dark theme matching our CSS
 base = "dark"
 primaryColor = "#3B82F6"
 backgroundColor = "#0B0F19"
@@ -45,29 +22,8 @@ textColor = "#F1F5F9"
 font = "sans serif"
 
 [browser]
-# Disable Streamlit's usage stats collection (privacy)
 gatherUsageStats = false
 
-# 🛡️ FIX v3.0.1: Removed `serverAddress = ""` — was breaking URL!
-# Now Streamlit will auto-detect localhost and show: http://localhost:8501
-
 [client]
-# Show toolbar (CRITICAL — needed for sidebar toggle!)
-# "viewer" = shows only relevant items (recommended for production)
-# "minimal" = hides everything
-# "developer" = shows all (dev only)
 toolbarMode = "viewer"
-
-# Hide the "Made with Streamlit" footer
-showErrorDetails = false
-
-[runner]
-# Fast rerun (only re-run when input changes)
-fastReruns = true
-
-# Magic mode (auto-displays variables)
-magicEnabled = false
-
-[ui]
-# Hide top padding (our CSS handles layout)
-hideTopBar = false
+showErrorDetails = true
